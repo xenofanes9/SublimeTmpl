@@ -5,67 +5,19 @@
         "children":
         [
             {
-                "id": "project",
+                "caption": "Folder Template",
+                "command": "sublime_tmpl_directory",
+                "args": {"dirs": []}
+            },
+            {
                 "caption": "Project Specific",
                 "command": "sublime_tmpl",
-                "args": {
-                    "type": "project",
-                    "paths": [],
-                }
+                "args": {"filterBy": "project", "dirs": []}
             },
             {
-                "id": "html",
-                "caption": "HTML",
+                "caption": "Pick Template",
                 "command": "sublime_tmpl",
-                "args": {
-                    "type": "html",
-                    "paths": [],
-                }
-            },
-            {
-                "id": "js",
-                "caption": "Javascript",
-                "command": "sublime_tmpl",
-                "args": {
-                    "type": "js",
-                    "paths": [],
-                }
-            },
-            {
-                "id": "css",
-                "caption": "CSS",
-                "command": "sublime_tmpl",
-                "args": {
-                    "type": "css",
-                    "paths": [],
-                }
-            },
-            {
-                "id": "php",
-                "caption": "PHP",
-                "command": "sublime_tmpl",
-                "args": {
-                    "type": "php",
-                    "paths": [],
-                }
-            },
-            {
-                "id": "python",
-                "caption": "python",
-                "command": "sublime_tmpl",
-                "args": {
-                    "type": "python",
-                    "paths": [],
-                }
-            },
-            {
-                "id": "ruby",
-                "caption": "ruby",
-                "command": "sublime_tmpl",
-                "args": {
-                    "type": "ruby",
-                    "paths": [],
-                }
+                "args": {"dirs": []}
             },
             {"caption": "-"},
             {

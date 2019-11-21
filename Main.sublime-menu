@@ -9,74 +9,20 @@
                 "children":
                 [
                     {
-                        "id": "project",
+                        "caption": "Folder Template",
+                        "command": "sublime_tmpl_directory",
+                        "args": {"dirs": []}
+                    },
+                    {
                         "caption": "Project Specific",
                         "command": "sublime_tmpl",
-                        "args": {
-                            "type": "project"
-                        }
+                        "args": {"filterBy": "project", "dirs": []}
                     },
                     {
-                        "id": "html",
-                        "caption": "HTML",
+                        "caption": "Pick Template",
                         "command": "sublime_tmpl",
-                        "args": {
-                            "type": "html"
-                        }
+                        "args": {"dirs": []}
                     },
-                    {
-                        "id": "js",
-                        "caption": "Javascript",
-                        "command": "sublime_tmpl",
-                        "args": {
-                            "type": "js"
-                        }
-                    },
-                    {
-                        "id": "css",
-                        "caption": "CSS",
-                        "command": "sublime_tmpl",
-                        "args": {
-                            "type": "css"
-                        }
-                    },
-                    {
-                        "id": "php",
-                        "caption": "PHP",
-                        "command": "sublime_tmpl",
-                        "args": {
-                            "type": "php"
-                        }
-                    },
-                    {
-                        "id": "python",
-                        "caption": "python",
-                        "command": "sublime_tmpl",
-                        "args": {
-                            "type": "python"
-                        }
-                    },
-                    {
-                        "id": "ruby",
-                        "caption": "ruby",
-                        "command": "sublime_tmpl",
-                        "args": {
-                            "type": "ruby"
-                        }
-                    },
-                    {"caption": "-"},
-                    {
-                        "id": "menu",
-                        "command": "open_file",
-                        "args": {"file": "${packages}/SublimeTmpl/Main.sublime-menu"},
-                        "caption": "Menu – Default"
-                    },
-                    {
-                        "id": "menu",
-                        "command": "open_file",
-                        "args": {"file": "${packages}/User/SublimeTmpl/Main.sublime-menu"},
-                        "caption": "Menu – User"
-                    }
                 ]
             }
         ]

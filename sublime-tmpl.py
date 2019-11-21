@@ -6,33 +6,111 @@
 import sublime
 import sublime_plugin
 # import sys
+import io
 import os
 import glob
 import datetime
-import zipfile
 import re
-import shutil
 
 PACKAGE_NAME = 'SublimeTmpl'
 TMLP_DIR = 'templates'
-KEY_SYNTAX = 'syntax'
-KEY_FILE_EXT = 'extension'
-
-# st3: Installed Packages/xx.sublime-package
-BASE_PATH = os.path.abspath(os.path.dirname(__file__))
-PACKAGES_PATH = sublime.packages_path()  # for ST2
-
-# sys.path += [BASE_PATH]
-# sys.path.append(BASE_PATH)
-# import sys;print(sys.path)
-
-IS_GTE_ST3 = int(sublime.version()[0]) >= 3
-DISABLE_KEYMAP = None
 
 
-def get_replace_pattern(settings):
+class MergedSettings(sublime.Settings):
+    """ Helper class to merge project and plugin settings.
+        Attempts to use project overrides first before defaulting back to plugin settings. """
+    def __init__(self, view):
+        self.global_settings = sublime.load_settings(PACKAGE_NAME + '.sublime-settings')
+        self.project_settings = view.settings().get("SublimeTmpl", {})  # project overrides
+     
+    def get(self, name, default=None, merge=False):
+        if merge and default is not None:
+            # assumes we're asking for a list!
+            return self.project_settings.get(name, []) + self.get_global(name, default)
+        return self.project_settings.get(name, self.get_global(name, default))
+
+    def get_global(self, name, default=None):
+        return self.global_settings.get(name, default)
+
+    def get_project(self, name, default=None):
+        return self.project_settings.get(name, default)
+        
+
+def get_settings(view):
+    """ Get settings object, with any project-specific overrides merged in """
+    return MergedSettings(view)
+
+def get_template_setting(template_format, settings, name, default=None, merge=False):
+    """ Search for template related setting, from specific to general """
+    return template_format.get(name, settings.get_project(name, settings.get_global(name, default)))
+
+def get_attr_setting(template_format, settings):
+    """ Merging attr together """
+    # return {**settings.get_global('attr', {}), **settings.get_project('attr', {}), template_format.get('attr', {})}
+    tmp = settings.get_global('attr', {}).copy()
+    tmp.update(settings.get_project('attr', {}))
+    tmp.update(template_format.get('attr', {}))
+    return tmp
+
+def get_template_locations(settings, filterBy='all'):
+    """ Return all known location template locations/formats.
+        If filterBy is specified, limit to specific (project) locations. """
+
+    # first grab all valid template formats
+    valid_formats = {}
+    for template_format in settings.get('template_formats', [], merge=True):
+
+        if 'id' not in template_format or 'format' not in template_format:
+            print("skipping format due to missing 'id' or 'format': {0}".format(template_format))
+            continue
+
+        key = template_format.get('id')
+        contents = template_format.get('format')
+
+        if 'replace_pattern' not in contents:
+            print("skipping format {0} due to missing 'replace_pattern'".format(key))
+            continue
+
+        if key not in valid_formats:          # don't overwrite a more specific format
+            valid_formats[key] = contents
+
+    # then grab all valid locations (and build dictionary of valid formats/locations)
+    # Each unique path is used as a dict key for the final locations returned, i.e. {path: format}
+
+    locations = {}
+    default_location = [os.path.join(sublime.packages_path(), 'User', PACKAGE_NAME, TMLP_DIR)]
+    
+    if filterBy == 'project':
+        candidates = settings.get_project('template_locations', [])
+    else:
+        candidates = settings.get('template_locations', [], merge=True)
+
+    for location in candidates:
+        if 'format' not in location:
+            print("skipping location {0} due to missing 'format'".format(location))
+            continue
+
+        format_id = location.get('format')
+
+        if format_id not in valid_formats:
+            print("skipping location {0} due to unknown format {1}".format(location, format_id))
+            continue 
+
+        folders = location.get('folders', default_location)
+
+        if not isinstance(folders, list):
+            folders = [folders]     # if a single folder specified, transform to a list
+
+        for folder in folders:
+            if folder not in location:
+                locations[folder] = valid_formats[format_id]
+
+    return locations
+
+    
+def get_replace_pattern(template_format):
     """ Set replacement pattern to look for in template files """
-    replace_pattern = settings.get('template_replace_pattern')
+    replace_pattern = template_format.get('replace_pattern')
 
     # sanity check the pattern
     try:
@@ -43,226 +121,305 @@ def get_replace_pattern(settings):
 
     return replace_pattern
 
-class MergedSettings(sublime.Settings):
-    """ Helper class to merge project and plugin settings.
-        Attempts to use project overrides first before defaulting back to plugin settings. """
-    def __init__(self, view):
-        self.fallback_settings = {}
-        self.settings = sublime.load_settings(PACKAGE_NAME + '.sublime-settings')
-        if IS_GTE_ST3:
-            self.fallback_settings = self.settings
-            self.settings = view.settings().get("SublimeTmpl", {})  # project overrides
-     
-    def get(self, name, default=None):
-        return self.settings.get(name, self.fallback_settings.get(name, default))
-        
+def get_window_variables(template_format, settings, win):
+    """ Extract window and project variables, if applicable """
+    if get_template_setting(template_format, settings, 'enable_project_variables', False) and hasattr(win, 'extract_variables'):
+        win_variables = win.extract_variables()
+        project_variables = get_template_setting(template_format, settings, 'project_variables', {})
+    else:
+        win_variables = {}
+        project_variables = {}
+    return (win_variables, project_variables)
 
-def get_settings(view, type=None):
-    """ Get settings object, with any project-specific overrides merged in """
-    settings = MergedSettings(view)
-    
-    if not type:
-        return settings
+def create_from_template(src, dest, pattern, attr, win_variables, project_variables):
+    """ Use src stream to write to dest stream, replacing any template values """
+    for line in src:
+        for key in attr:
+            line = line.replace(pattern % key, attr.get(key, ''))
 
-    opts = settings.get(type, [])
-    return opts
+        if win_variables:
+            for key in project_variables:
+                line = line.replace(pattern % project_variables[key], win_variables.get(key, ''))
+
+        # keep ${var..}
+        if pattern == "${%s}":
+            line = re.sub(r"(?<!\\)\${(?!\d)", '\${', line)
+
+        dest.write(line.replace('\r', '')) # replace \r\n -> \n
+
+
+class SublimeTmplDirectoryCommand(sublime_plugin.WindowCommand):
+    """ Run directory templates (instead of a single file) """
+
+    class TemplateInputHandler(sublime_plugin.ListInputHandler):
+        def placeholder(self):
+            return "Choose template"
+
+        def list_items(self):
+            if not self.template_locations:
+                sublime.message_dialog('No valid "template_folders" specified in current project file')
+                return None
+            project_templates = []
+            for (path, template_format) in self.template_locations.items():
+                if 'filename_replace_pattern' in template_format:
+                    for dirpath, dirnames, filenames in os.walk(path):
+                        for dirname in dirnames:
+                            project_templates.append((dirname, os.path.join(dirpath, dirname)))
+                        break  # don't recurse for folder templates
+            return project_templates
+
+    class NameInputHandler(sublime_plugin.TextInputHandler):
+        def placeholder(self):
+            return "Replace 'Name'"
+
+    class OutputDirInputHandler(sublime_plugin.TextInputHandler):
+        def placeholder(self):
+            return "Output Path"
+
+        def initial_text(self):
+            # pick a sane default for destination folder
+            return os.path.join(self.args.get('dirs', [''])[0], self.args.get('name', ''))
+
+    def set_local_settings(self, filterBy='all'):
+        """ Save off local settings needed by both input() handlers and run() """
+        if not hasattr(self, 'settings'):
+            self.settings = get_settings(self.window.active_view())
+
+        if not hasattr(self, 'template_locations'):
+            self.template_locations = get_template_locations(self.settings, filterBy)
+
+    def input(self, args):
+        """ Ensures appropriate input is provided by user for template generation """
+        self.set_local_settings(args.get('filterBy'))
+
+        if 'template' not in args:
+            handler = SublimeTmplDirectoryCommand.TemplateInputHandler()
+            handler.template_locations = self.template_locations
+            return handler
+
+        if 'name' not in args:
+            return SublimeTmplDirectoryCommand.NameInputHandler()
+
+        if 'output_dir' not in args:
+            handler = SublimeTmplDirectoryCommand.OutputDirInputHandler()
+            handler.args = args
+            return handler
+
+        return None
+
+    def run(self, template, name, output_dir, dirs, filterBy='all'):
+        """ Run directory template """
+        self.set_local_settings(filterBy)
+        settings = self.settings
+
+        template_path = os.path.abspath(template)
+        template_format_id = os.path.dirname(template_path)
+
+        if template_format_id not in self.template_locations:
+            print("Can't find valid template location or associated format {0}".format(template_format_id))
+            print(self.template_locations)
+        template_format = self.template_locations[template_format_id]
+
+        file_pattern = template_format.get('filename_replace_pattern', '')
+        file_pattern = file_pattern.replace("%s", 'name')
+
+        # file contents setup (pull out later!)
+        pattern = get_replace_pattern(template_format)
+        attr = get_attr_setting(template_format, settings)
+        dateformat = get_template_setting(template_format, settings, 'date_format', '%Y-%m-%d')
+        attr['name'] = name
+        attr['date'] = datetime.datetime.now().strftime(dateformat)
+        (win_variables, project_variables) = get_window_variables(template_format, settings, self.window)
+
+        if not os.path.isdir(output_dir):
+            os.makedirs(output_dir)
+
+        for (dirpath, dirnames, filenames) in os.walk(template_path):
+            relativepath = os.path.relpath(dirpath.replace(file_pattern, name), template_path)
+
+            for filename in filenames:
+                # copy over any files in current directory
+                output_filepath = os.path.join(output_dir, relativepath, filename.replace(file_pattern, name))
+                src_filepath = os.path.join(dirpath, filename)
+
+                with open(src_filepath, 'r') as src, open(output_filepath, 'w') as dest:
+                    create_from_template(src, dest, pattern, attr, win_variables, project_variables)
+
+            for dirname in dirnames:
+                # create any necessary child directories (walk() will recurse into them later)
+                output_curdir = os.path.join(output_dir, dirname.replace(file_pattern, name))
+                if not os.path.isdir(output_curdir):
+                    os.makedirs(output_curdir)
 
 
 class SublimeTmplCommand(sublime_plugin.TextCommand):
 
-    def run(self, edit, type='html', paths = None):
-        view = self.view
+    class TemplateInputHandler(sublime_plugin.ListInputHandler):
+        def placeholder(self):
+            return "Choose template"
 
-        if type == 'project':
-            # need to present project-specific templates for user to select
+        def list_items(self):
+            project_templates = []
+            for (path, template_format) in self.template_locations.items():
+                if 'extensions' in template_format:
+                    for dirpath, dirnames, filenames in os.walk(path):
+                        for filename in filenames:
+                            (name, ext) = os.path.splitext(filename)
+                            if ext in template_format.get('extensions'):
+                                project_templates.append((filename, os.path.join(dirpath, filename)))
+            return project_templates
 
-            projectFolder = self.get_project_template_folder()
-            if not projectFolder:
-                sublime.message_dialog('No "template_folder" specified in current project file')
-                return False
+    def set_local_settings(self, filterBy):
+        """ Save off local settings needed by both input() handlers and run() """
+        if not hasattr(self, 'settings'):
+            self.settings = get_settings(self.view)
 
-            template_extension = self.get_template_extension()
-            self.project_templates = []
-            for dirpath, dirnames, filenames in os.walk(projectFolder):
-                # for dirname in dirnames:
-                #     self.project_templates.append(dirname)
-                for filename in filenames:
-                    if os.path.splitext(filename)[1] == template_extension:
-                        self.project_templates.append((dirpath, os.path.splitext(filename)[0]))
-            
-            options = []
-            for (path, name) in self.project_templates:
-                options.append("Template: {}".format(name))
+        if not hasattr(self, 'template_locations'):
+            self.template_locations = get_template_locations(self.settings, filterBy)
 
-            if not options:
-                sublime.message_dialog('No templates found in current project template folder {0}'.format(projectFolder))
-                return False
+    def input(self, args):
+        """ Ensures appropriate input is provided by user for template generation """
+        self.set_local_settings(args.get('filterBy'))
 
-            self.view.window().show_quick_panel(
-                options,
-                selected_index=0,
-                on_select=self.run_project_template,
-                on_highlight=None,
-                )
+        if 'template' not in args:
+            handler = SublimeTmplCommand.TemplateInputHandler()
+            handler.template_locations = self.template_locations
+            return handler
+        return None
 
+    def run(self, edit, template, dirs, filterBy='all'):
+        """ Generate file from template """
+        self.set_local_settings(filterBy)
+        self.process_template(template, dirs)
+
+    def process_template(self, template, dirs):
+        """ Process selected template """
+        template_path = os.path.abspath(template)
+        template_format = None
+
+        # if templates are in nested subfolders, need to walk up the chain to find template_format
+        child_directory = None
+        parent_directory = os.path.dirname(template_path)
+
+        while parent_directory != child_directory:
+            if parent_directory in self.template_locations:
+                template_format = self.template_locations[parent_directory]
+                break
+            child_directory = parent_directory
+            parent_directory = os.path.dirname(parent_directory)
+
+        if not template_format:
+            sublime.message_dialog('No valid templates found')
             return
 
-        opts = get_settings(self.view, type)
-        tmpl = self.get_code(type)
-
-        # print('global', DISABLE_KEYMAP, IS_GTE_ST3);
-        if DISABLE_KEYMAP:
-            return False
-
-        # print(KEY_SYNTAX in opts)
-        self.tab = self.creat_tab(view, paths)
-
-        self.set_syntax(opts)
-        # sublime.set_timeout(lambda: self.set_syntax(opts), 1000)
-        self.set_code(tmpl)
-
-    def run_project_template(self, index):
-        self.view.run_command('sublime_tmpl',
-                                    args={'type': self.project_templates[index][1]})
-    
-    @staticmethod
-    def open_file(path, mode='r'):
-        with open(path, mode) as fp:
-            code = fp.read()
-        return code
+        tmpl = self.get_code(template, template_format)
+        tab = self.create_tab(self.view, template_format, dirs)
+        
+        (basefile, _) = os.path.splitext(os.path.basename(template))
+        (base, ext) = os.path.splitext(basefile)
+        if not ext:
+            ext = base      # if no extension was provided in template name, maybe the base IS an extension?
+        if ext.startswith('.'):
+            ext = ext[1:]
+        
+        # opts = self.settings.get(type, [])
+        self.set_syntax(tab, ext)
+        print(tab.settings().get('syntax'))
+        self.set_code(tab, tmpl)
 
     @staticmethod
     def is_resource_path(path):
         """ Check if an absolute path points to an ST3 resource folder """
-        if IS_GTE_ST3:
-            return os.path.commonprefix([path, sublime.packages_path()]) == sublime.packages_path()
-        else:
-            return False   # doesn't apply for ST2
+        return os.path.commonprefix([path, sublime.packages_path()]) == sublime.packages_path()
 
     @staticmethod
     def format_as_resource_path(path):
         """ Convert an absolute path to an ST3 resource path """
         return os.path.join('Packages', os.path.relpath(path, sublime.packages_path()))
 
-    def get_template_folders(self):
-        """ Returns list of paths expected to contain templates.
-            Paths are absolute, additional conversion needed for ST3 resource paths """
-        project_tmpl_dir = self.get_project_template_folder()
-        tmpl_dir = os.path.join(PACKAGES_PATH, PACKAGE_NAME, TMLP_DIR)
-        user_tmpl_dir = os.path.join(PACKAGES_PATH, 'User', PACKAGE_NAME, TMLP_DIR)
-
-        if project_tmpl_dir is not None:
-           project_tmpl_dir = os.path.abspath(project_tmpl_dir)
-
-        paths = []
-
-        # inserted in order we want to search (more specific -> more general)
-        if project_tmpl_dir is not None and os.path.exists(project_tmpl_dir):
-            paths.append(project_tmpl_dir)
-        if os.path.exists(user_tmpl_dir):
-            paths.append(user_tmpl_dir)
-        if os.path.exists(tmpl_dir):
-            paths.append(tmpl_dir)
-        
-        return paths
-
-    def get_project_template_folder(self):
-        """ Get project template folder (if one is set) """
-        return get_settings(self.view).get('template_folder', None)
-
-    def get_template_extension(self):
-        return get_settings(self.view).get('template_extension', '.tmpl')
-
-    def get_code(self, type):
+    def get_code(self, template, template_format):
+        """ Returns template formatted code for new file """
         code = ''
-        file_name = "%s%s" % (type, self.get_template_extension())
         templateFound = False
 
-        paths = self.get_template_folders()
-
-        for path in paths:
-            fullpath = os.path.join(path, file_name)
-            if self.is_resource_path(fullpath):
-                try:
-                    fullpath = self.format_as_resource_path(fullpath)
-                    code = sublime.load_resource(fullpath)
-                    templateFound = True
-                except IOError:
-                    pass  # try the next folder
-            else:
-                if os.path.isfile(fullpath):
-                    code = self.open_file(fullpath)
-                    templateFound = True
-
-            if templateFound:
-                break
+        if self.is_resource_path(template):
+            try:
+                template = self.format_as_resource_path(template)
+                code = io.StringIO(sublime.load_resource(template))
+                templateFound = True
+            except IOError:
+                pass  # try to load as a non-resource file
 
         if not templateFound:
-            sublime.message_dialog('[Warning] No such file {0} found in paths {1}: '.format(
-                file_name, paths))
+            with open(template, 'r') as fp:
+                code = io.StringIO(fp.read())
 
-        return self.format_tag(code)
+        return self.format_tag(code, template_format)
 
-    def format_tag(self, code):
+    def format_tag(self, code, template_format):
         """ Replace matched patterns in file contents """
-        win = self.view.window()
-        code = code.replace('\r', '') # replace \r\n -> \n
-        # format
-        settings = get_settings(self.view)
-        pattern = get_replace_pattern(settings)
- 
-        format = settings.get('date_format', '%Y-%m-%d')
-        date = datetime.datetime.now().strftime(format)
-        if not IS_GTE_ST3:
-            code = code.decode('utf8') # for st2 && Chinese characters
-        code = code.replace(pattern.replace("%s", "date"), date)
+        pattern = get_replace_pattern(template_format)
+        attr = get_attr_setting(template_format, self.settings)
+        dateformat = get_template_setting(template_format, self.settings, 'date_format', '%Y-%m-%d')
+        attr['date'] = datetime.datetime.now().strftime(dateformat)
+        (win_variables, project_variables) = get_window_variables(template_format,self.settings, self.view.window())
 
-        attr = settings.get('attr', {})
-        for key in attr:
-            code = code.replace(pattern % key, attr.get(key, ''))
+        formatted_code = io.StringIO("")
+        create_from_template(code, formatted_code, pattern, attr, win_variables, project_variables)
 
-        if settings.get('enable_project_variables', False) and hasattr(win, 'extract_variables'):
-            variables = win.extract_variables()
-            project_variables = settings.get('project_variables', {})
-            for key in project_variables:
-                code = code.replace(pattern % project_variables[key], variables.get(key, ''))
+        return formatted_code.getvalue()
 
-        # keep ${var..}
-        if pattern == "${%s}":
-            code = re.sub(r"(?<!\\)\${(?!\d)", '\${', code)
-        return code
-
-    def creat_tab(self, view, paths = None):
+    @staticmethod
+    def create_tab(view, template_format, paths=None):
+        """ Create a new file to contain template output """
         if paths is None:
-            paths = [None]
-
+            paths = []
         win = view.window()
-        # tab = win.open_file('/tmp/123')
         tab = win.new_file()
-        # tab.set_name('untitled')
         active = win.active_view()
-        active.settings().set('default_dir', paths[0])
+        if len(paths) == 1:
+            active.settings().set('default_dir', paths[0])
+
+        if template_format.get('enable_file_variables_on_save', False):
+            active.settings().set('tmpl_replace_pattern', get_replace_pattern(template_format))
+            active.settings().set('tmpl_file_variables_on_save', template_format.get('file_variables_on_save', {}))
         return tab
 
-    def set_code(self, code):
-        tab = self.tab
-        # insert codes
+    @staticmethod
+    def set_code(tab, code):
+        """ Insert templated contents to new file """
         tab.run_command('insert_snippet', {'contents': code})
 
-    def set_syntax(self, opts):
-        v = self.tab
-        # syntax = self.view.settings().get('syntax') # from current file
-        syntax = opts[KEY_SYNTAX] if KEY_SYNTAX in opts else ''
-        # print(syntax) # tab.set_syntax_file('Packages/Diff/Diff.tmLanguage')
-        v.set_syntax_file(syntax)
+    @staticmethod
+    def set_syntax(tab, ext):
+        """ Set syntax on new file """
+        tab.settings().set('default_extension', ext)
+        # # syntax = self.view.settings().get('syntax') # from current file
+        # syntax = opts[KEY_SYNTAX] if KEY_SYNTAX in opts else ''
+        # # print(syntax) # tab.set_syntax_file('Packages/Diff/Diff.tmLanguage')
+        # tab.assign_syntax(syntax)
 
-        # print(opts[KEY_FILE_EXT])
-        if KEY_FILE_EXT in opts:
-            v.settings().set('default_extension', opts[KEY_FILE_EXT])
+
+class SublimeTmplSaveFileEventListener(sublime_plugin.ViewEventListener):
+
+    @classmethod
+    def is_applicable(cls, settings):
+        return settings.get('tmpl_replace_pattern') is not None
+
+    def on_pre_save(self):
+        filepath = self.view.file_name()
+        filename = os.path.basename(filepath)
+        settings = self.view.settings()
+        pattern = settings.get('tmpl_replace_pattern')
+        variables = settings.get('tmpl_file_variables_on_save', {})
+        self.view.run_command('sublime_tmpl_replace', {'old': pattern.replace("%s", variables.get('saved_filepath', '')), 'new': filepath})
+        self.view.run_command('sublime_tmpl_replace', {'old': pattern.replace("%s", variables.get('saved_filename', '')), 'new': filename})
+        settings.erase('tmpl_replace_pattern')
+        settings.erase('tmpl_file_variables_on_save')
+
 
 class SublimeTmplReplaceCommand(sublime_plugin.TextCommand):
     def run(self, edit, old, new):
-        # print('tmpl_replace', old, new)
         region = sublime.Region(0, self.view.size())
         if region.empty() or not old or not new:
             return
@@ -270,119 +427,27 @@ class SublimeTmplReplaceCommand(sublime_plugin.TextCommand):
         s = s.replace(old, new)
         self.view.replace(edit, region, s)
 
-class SublimeTmplEventListener(sublime_plugin.EventListener):
-    def __init__(self):
-        self.unsaved_ids = {}
 
-    def on_query_context(self, view, key, operator, operand, match_all):
-        settings = get_settings(view)
-        disable_keymap_actions = settings.get('disable_keymap_actions', '')
-        # print ("key1: %s, %s" % (key, disable_keymap_actions))
-        global DISABLE_KEYMAP
-        DISABLE_KEYMAP = False;
-        if not key.startswith('sublime_tmpl.'):
-            return None
-        if not disable_keymap_actions: # no disabled actions
-            return True
-        elif disable_keymap_actions == 'all' or disable_keymap_actions == True: # disable all actions
-            DISABLE_KEYMAP = True;
-            return False
-        prefix, name = key.split('.')
-        ret = name not in re.split(r'\s*,\s*', disable_keymap_actions.strip())
-        # print(name, ret)
-        DISABLE_KEYMAP = True if not ret else False;
-        return ret
+def plugin_loaded():
+    """ when first loaded, generate user template folder if it doesn't already exist """
+    
+    custom_path = os.path.join(sublime.packages_path(), 'User', PACKAGE_NAME, TMLP_DIR)
 
-    def on_activated(self, view):
-        if view.file_name():
-            return
-        settings = get_settings(view)
-        if settings.get('enable_file_variables_on_save', False):
-            self.unsaved_ids[view.id()] = True
-        # print('on_activated', self.unsaved_ids, view.id(), view.file_name())
-        
-    def on_pre_save(self, view):
-        if not view.id() in self.unsaved_ids:
-            return
-        settings = get_settings(view)
-        if settings.get('enable_file_variables_on_save', False):
-            filepath = view.file_name()
-            filename = os.path.basename(filepath)
-            pattern = get_replace_pattern(settings)
-            variables = settings.get('file_variables_on_save', {})
-            view.run_command('sublime_tmpl_replace', {'old': pattern.replace("%s", variables.get('saved_filepath', '')), 'new': filepath})
-            view.run_command('sublime_tmpl_replace', {'old': pattern.replace("%s", variables.get('saved_filename', '')), 'new': filename})
-            del self.unsaved_ids[view.id()]
+    tmlang = sublime.find_resources('*.tmLanguage')
+    for i in tmlang:
+        print(i)
 
-def plugin_loaded():  # for ST3 >= 3016
-    # global PACKAGES_PATH
-    PACKAGES_PATH = sublime.packages_path()
-    TARGET_PATH = os.path.join(PACKAGES_PATH, PACKAGE_NAME)
-    # print(BASE_PATH, os.path.dirname(BASE_PATH), TARGET_PATH)
+    if not os.path.isdir(custom_path):
+    # User folder doesn't exist to hold templates, create one and populate it with default templates
+        base_path = os.path.abspath(os.path.dirname(__file__))
 
-    # auto create custom_path
-    custom_path = os.path.join(PACKAGES_PATH, 'User', PACKAGE_NAME, TMLP_DIR)
-    # print(custom_path, os.path.isdir(custom_path))
-    not_existed = not os.path.isdir(custom_path)
-    if not_existed:
-        os.makedirs(custom_path)
-
-        files = glob.iglob(os.path.join(BASE_PATH, TMLP_DIR, '*.tmpl'))
-        for file in files:
-            dst_file = os.path.join(custom_path, os.path.basename(file))
-            if not os.path.exists(dst_file):
-                shutil.copy(file, dst_file)
-
-
-    # first run (https://git.io/vKMIS, does not need extract files)
-    if not os.path.isdir(TARGET_PATH):
-        os.makedirs(os.path.join(TARGET_PATH, TMLP_DIR))
-        # copy user files
-        tmpl_dir = TMLP_DIR + '/'
-        file_list = [
-            'Default.sublime-commands', 'Main.sublime-menu',
-            # if don't copy .py, ST3 throw: ImportError: No module named # fix: restart sublime
-            'sublime-tmpl.py',
-            'README.md',
-            tmpl_dir + 'css.tmpl', tmpl_dir + 'html.tmpl',
-            tmpl_dir + 'js.tmpl', tmpl_dir + 'php.tmpl',
-            tmpl_dir + 'python.tmpl', tmpl_dir + 'ruby.tmpl',
-            tmpl_dir + 'xml.tmpl'
-        ]
-        try:
-            extract_zip_resource(BASE_PATH, file_list, TARGET_PATH)
-        except Exception as e:
-            print(e)
-
-    # old: *.user.tmpl compatible fix
-    files = glob.iglob(os.path.join(os.path.join(TARGET_PATH, TMLP_DIR), '*.user.tmpl'))
-    for file in files:
-        filename = os.path.basename(file).replace('.user.tmpl', '.tmpl')
-        # print(file, '=>', os.path.join(custom_path, filename));
-        os.rename(file, os.path.join(custom_path, filename))
-
-    # old: settings-custom_path compatible fix
-    settings = sublime.load_settings(PACKAGE_NAME + '.sublime-settings')
-    old_custom_path = settings.get('custom_path', '')
-    if old_custom_path and os.path.isdir(old_custom_path):
-        # print(old_custom_path)
-        files = glob.iglob(os.path.join(old_custom_path, '*.tmpl'))
-        for file in files:
-            filename = os.path.basename(file).replace('.user.tmpl', '.tmpl')
-            # print(file, '=>', os.path.join(custom_path, filename))
-            os.rename(file, os.path.join(custom_path, filename))
-
-if not IS_GTE_ST3:
-    sublime.set_timeout(plugin_loaded, 0)
-
-def extract_zip_resource(path_to_zip, file_list, extract_dir=None):
-    if extract_dir is None:
-        return
-    # print(extract_dir)
-    if os.path.exists(path_to_zip):
-        with zipfile.ZipFile(path_to_zip, 'r') as z:
-            for f in z.namelist():
-                # if f.endswith('.tmpl'):
-                if f in file_list:
-                    # print(f)
-                    z.extract(f, extract_dir)
+        if __file__.endswith("sublime-package"):
+            try:
+                import zipfile
+                with zipfile.ZipFile(__file__, 'r') as z:
+                    z.extract(TMLP_DIR, custom_path)
+            except Exception as e:
+                print(e)
+        else:
+            import shutil
+            shutil.copytree(os.path.join(base_path, TMLP_DIR), custom_path)
